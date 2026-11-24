@@ -166,3 +166,6 @@ bin/
 # Logs
 *.wpilog
 *.log
+
+# AdvantageKit generated build info
+src/main/java/frc/robot/BuildConstants.java
