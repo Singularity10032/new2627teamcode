@@ -43,7 +43,49 @@ public class DriveCommands {
   private static final double WHEEL_RADIUS_MAX_VELOCITY = 0.25; // Rad/Sec
   private static final double WHEEL_RADIUS_RAMP_RATE = 0.05; // Rad/Sec^2
 
+  // Singularity: max change in driver translation command, in m/s per second. Same value as our
+  // old Game Code (Settings.Swerve.Constraints.MAX_ACCEL_M_PER_S_SQUARED). Limiting the x/y
+  // vector (not speed + angle separately) keeps a back-to-forward reversal on the forward/back
+  // line through zero, so the modules don't swing sideways and back mid-reversal.
+  private static final double MAX_LINEAR_ACCEL = 15.0;
+
   private DriveCommands() {}
+
+  /** Limits how fast a 2D velocity command can change, treating x/y together as a vector. */
+  private static class VectorRateLimiter {
+    private final double maxDeltaPerLoop;
+    private Translation2d last = Translation2d.kZero;
+
+    VectorRateLimiter(double maxRatePerSec) {
+      maxDeltaPerLoop = maxRatePerSec * 0.02;
+    }
+
+    Translation2d calculate(Translation2d target) {
+      Translation2d delta = target.minus(last);
+      double norm = delta.getNorm();
+      if (norm > maxDeltaPerLoop) {
+        delta = delta.times(maxDeltaPerLoop / norm);
+      }
+      last = last.plus(delta);
+      return last;
+    }
+
+    void reset(Translation2d current) {
+      last = current;
+    }
+  }
+
+  /** Measured robot velocity in the driver's field frame (same frame as joystick commands). */
+  private static Translation2d getDriverRelativeVelocity(Drive drive) {
+    boolean isFlipped =
+        DriverStation.getAlliance().isPresent()
+            && DriverStation.getAlliance().get() == Alliance.Red;
+    ChassisSpeeds fieldSpeeds =
+        ChassisSpeeds.fromRobotRelativeSpeeds(
+            drive.getChassisSpeeds(),
+            isFlipped ? drive.getRotation().plus(new Rotation2d(Math.PI)) : drive.getRotation());
+    return new Translation2d(fieldSpeeds.vxMetersPerSecond, fieldSpeeds.vyMetersPerSecond);
+  }
 
   private static Translation2d getLinearVelocityFromJoysticks(double x, double y) {
     // Apply deadband
@@ -67,35 +109,40 @@ public class DriveCommands {
       DoubleSupplier xSupplier,
       DoubleSupplier ySupplier,
       DoubleSupplier omegaSupplier) {
+    VectorRateLimiter linearLimiter = new VectorRateLimiter(MAX_LINEAR_ACCEL);
     return Commands.run(
-        () -> {
-          // Get linear velocity
-          Translation2d linearVelocity =
-              getLinearVelocityFromJoysticks(xSupplier.getAsDouble(), ySupplier.getAsDouble());
+            () -> {
+              // Get linear velocity (m/s), rate limited as a vector
+              Translation2d linearVelocity =
+                  linearLimiter.calculate(
+                      getLinearVelocityFromJoysticks(
+                              xSupplier.getAsDouble(), ySupplier.getAsDouble())
+                          .times(drive.getMaxLinearSpeedMetersPerSec()));
 
-          // Apply rotation deadband
-          double omega = MathUtil.applyDeadband(omegaSupplier.getAsDouble(), DEADBAND);
+              // Apply rotation deadband
+              double omega = MathUtil.applyDeadband(omegaSupplier.getAsDouble(), DEADBAND);
 
-          // Square rotation value for more precise control
-          omega = Math.copySign(omega * omega, omega);
+              // Square rotation value for more precise control
+              omega = Math.copySign(omega * omega, omega);
 
-          // Convert to field relative speeds & send command
-          ChassisSpeeds speeds =
-              new ChassisSpeeds(
-                  linearVelocity.getX() * drive.getMaxLinearSpeedMetersPerSec(),
-                  linearVelocity.getY() * drive.getMaxLinearSpeedMetersPerSec(),
-                  omega * drive.getMaxAngularSpeedRadPerSec());
-          boolean isFlipped =
-              DriverStation.getAlliance().isPresent()
-                  && DriverStation.getAlliance().get() == Alliance.Red;
-          drive.runVelocity(
-              ChassisSpeeds.fromFieldRelativeSpeeds(
-                  speeds,
-                  isFlipped
-                      ? drive.getRotation().plus(new Rotation2d(Math.PI))
-                      : drive.getRotation()));
-        },
-        drive);
+              // Convert to field relative speeds & send command
+              ChassisSpeeds speeds =
+                  new ChassisSpeeds(
+                      linearVelocity.getX(),
+                      linearVelocity.getY(),
+                      omega * drive.getMaxAngularSpeedRadPerSec());
+              boolean isFlipped =
+                  DriverStation.getAlliance().isPresent()
+                      && DriverStation.getAlliance().get() == Alliance.Red;
+              drive.runVelocity(
+                  ChassisSpeeds.fromFieldRelativeSpeeds(
+                      speeds,
+                      isFlipped
+                          ? drive.getRotation().plus(new Rotation2d(Math.PI))
+                          : drive.getRotation()));
+            },
+            drive)
+        .beforeStarting(() -> linearLimiter.reset(getDriverRelativeVelocity(drive)));
   }
 
   /**
@@ -117,13 +164,17 @@ public class DriveCommands {
             ANGLE_KD,
             new TrapezoidProfile.Constraints(ANGLE_MAX_VELOCITY, ANGLE_MAX_ACCELERATION));
     angleController.enableContinuousInput(-Math.PI, Math.PI);
+    VectorRateLimiter linearLimiter = new VectorRateLimiter(MAX_LINEAR_ACCEL);
 
     // Construct command
     return Commands.run(
             () -> {
-              // Get linear velocity
+              // Get linear velocity (m/s), rate limited as a vector
               Translation2d linearVelocity =
-                  getLinearVelocityFromJoysticks(xSupplier.getAsDouble(), ySupplier.getAsDouble());
+                  linearLimiter.calculate(
+                      getLinearVelocityFromJoysticks(
+                              xSupplier.getAsDouble(), ySupplier.getAsDouble())
+                          .times(drive.getMaxLinearSpeedMetersPerSec()));
 
               // Calculate angular speed
               double omega =
@@ -132,10 +183,7 @@ public class DriveCommands {
 
               // Convert to field relative speeds & send command
               ChassisSpeeds speeds =
-                  new ChassisSpeeds(
-                      linearVelocity.getX() * drive.getMaxLinearSpeedMetersPerSec(),
-                      linearVelocity.getY() * drive.getMaxLinearSpeedMetersPerSec(),
-                      omega);
+                  new ChassisSpeeds(linearVelocity.getX(), linearVelocity.getY(), omega);
               boolean isFlipped =
                   DriverStation.getAlliance().isPresent()
                       && DriverStation.getAlliance().get() == Alliance.Red;
@@ -149,7 +197,11 @@ public class DriveCommands {
             drive)
 
         // Reset PID controller when command starts
-        .beforeStarting(() -> angleController.reset(drive.getRotation().getRadians()));
+        .beforeStarting(
+            () -> {
+              angleController.reset(drive.getRotation().getRadians());
+              linearLimiter.reset(getDriverRelativeVelocity(drive));
+            });
   }
 
   /**
